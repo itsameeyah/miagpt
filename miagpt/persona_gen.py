@@ -1,7 +1,8 @@
 """Write a persona.md from exported chat logs, with a review loop.
 
-The model gets measured typing stats plus real example messages, and writes the persona file. You
-read the draft in the terminal, keep it, or say what to change and it rewrites.
+One export or a whole folder of them. Only the chosen person's messages are ever read into it, and if
+there's more than fits comfortably in one request the sample is summarised batch by batch first, then
+merged into the persona.
 
     python tools/persona_from_logs.py --logs ~/exports --person sam
     python -c "from miagpt import persona_gen; persona_gen.bootstrap()"
@@ -9,10 +10,12 @@ read the draft in the terminal, keep it, or say what to change and it rewrites.
 
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
-from . import config, llm, prompt, style
+from . import config, context, llm, prompt, style
 
 SYSTEM = """You write persona files for a Discord bot that speaks in the voice of one real person.
 
@@ -58,6 +61,20 @@ shows. Include how to handle being asked if it's real.
 # never repeat yourself
 a short paragraph: quote nothing verbatim from this file, reword every reply."""
 
+BATCH_SYSTEM = """You read one batch of a real person's Discord messages and take notes for someone
+who is about to write a persona file for a bot that imitates them.
+
+Report only what the text actually shows, in short bullets under these headings:
+
+- how they type: length, casing, punctuation, dropped apostrophes, slang, filler, emoji
+- how they sound: tone, teasing, whether they hedge or commit, how they react to being wrong
+- topics and running jokes they keep coming back to
+- quotes: 5-8 short verbatim lines that carry the voice, each on its own bullet
+- boundaries: anything they clearly never say, or would refuse to talk about
+
+Notes only. No persona text, no extra headings, no preamble, under 400 words. Write "nothing
+notable" for an empty heading instead of inventing something. Never invent facts about their life."""
+
 
 def _stats_block(s: dict) -> str:
     top = ", ".join(s["top_words"][:20]) or "(none)"
@@ -65,7 +82,7 @@ def _stats_block(s: dict) -> str:
     drops = []
     for pair, (short, long) in s["contractions"].items():
         if short + long >= 5:
-            drops.append(f'"{short}" {short}x vs "{long}" {long}x')
+            drops.append(f'"{pair.split("/")[0]}" {short}x vs "{pair.split("/")[1]}" {long}x')
     years = ", ".join(f"{y}: {n}" for y, n in s["years"].items()) or "unknown"
     return "\n".join([
         f"- messages measured: {s['count']} ({years})",
@@ -80,9 +97,13 @@ def _stats_block(s: dict) -> str:
     ])
 
 
+def _bot_name(fallback: str) -> str:
+    return config.section("bot").get("name") or f"{fallback}bot"
+
+
 def build_request(name: str, stats: dict, samples: list[str]) -> str:
     examples = "\n".join(f"- {line}" for line in samples) or "- (no examples available)"
-    bot_name = config.section("bot").get("name") or f"{name}bot"
+    bot_name = _bot_name(name)
     return (
         f"the bot is called {bot_name!r}. the human it copies is {name!r}. never mix the two up: the\n"
         f"bot is an ai copy, and the file must name it {bot_name!r} in '# who you are'.\n\n"
@@ -91,6 +112,43 @@ def build_request(name: str, stats: dict, samples: list[str]) -> str:
         f"example messages they actually sent (quote from these, verbatim):\n{examples}\n\n"
         f"write the persona file now."
     )
+
+
+def batch_request(name: str, rows: list[dict], index: int, total: int) -> str:
+    channels = sorted({row.get("channel") or "?" for row in rows})
+    lines = "\n".join(f"- {row['text']}" for row in rows)
+    return (
+        f"person: {name}\n"
+        f"batch {index} of {total}, from: {', '.join(channels)}\n"
+        f"{len(rows)} messages:\n\n{lines}\n\n"
+        f"take notes on batch {index} now."
+    )
+
+
+def merge_request(name: str, stats: dict, notes: list[str], quotes: list[str],
+                  previous: str = "", feedback: str = "") -> str:
+    blocks = "\n\n".join(f"--- notes {i} ---\n{note}" for i, note in enumerate(notes, 1))
+    quote_block = "\n".join(f"- {line}" for line in quotes) or "- (none available)"
+    bot_name = _bot_name(name)
+    request = (
+        f"the bot is called {bot_name!r}. the human it copies is {name!r}. never mix the two up: the\n"
+        f"bot is an ai copy, and the file must name it {bot_name!r} in '# who you are'.\n\n"
+        f"person: {name}\n\n"
+        f"measured typing style (exact, counted across every message — trust these over the notes):\n"
+        f"{_stats_block(stats)}\n\n"
+        f"notes taken from {len(notes)} batches of their messages:\n\n{blocks}\n\n"
+        f"real messages they sent, verbatim — quote 6-8 of these in '# things they've said':\n"
+        f"{quote_block}\n\n"
+        f"write the persona file now. quote only lines from that list or from the notes, verbatim."
+    )
+    if previous and feedback:
+        request += (
+            f"\n\nthe current draft is below. rewrite the whole file, applying the user's changes:\n\n"
+            f"--- current draft ---\n{previous}\n--- end draft ---\n\n"
+            f"changes the user asked for: {feedback}\n\n"
+            f"return the complete revised file, markdown only. keep quoting only lines from the list."
+        )
+    return request
 
 
 def clean_markdown(text: str) -> str:
@@ -108,9 +166,20 @@ def clean_markdown(text: str) -> str:
     return text.strip() + "\n"
 
 
+def _persona_settings() -> dict:
+    cfg = config.section("persona")
+    return {
+        "max_tokens": int(cfg.get("generate_max_tokens", 4000)),
+        "effort": str(cfg.get("generate_reasoning_effort", "low")),
+        "note_tokens": int(cfg.get("note_max_tokens", 1600)),
+        "batch_chars": int(cfg.get("batch_characters", 28_000)),
+    }
+
+
 def draft(name: str, stats: dict, samples: list[str], previous: str = "",
           feedback: str = "") -> str:
     """One model call: the draft, or that draft revised to the user's notes."""
+    settings = _persona_settings()
     request = build_request(name, stats, samples)
     if previous and feedback:
         request += (
@@ -123,36 +192,144 @@ def draft(name: str, stats: dict, samples: list[str], previous: str = "",
         SYSTEM,
         [{"role": "user", "content": request}],
         "persona-gen",
-        max_tokens=int(config.section("persona").get("generate_max_tokens", 4000)),
+        max_tokens=settings["max_tokens"],
         temperature=0.8,
-        effort=str(config.section("persona").get("generate_reasoning_effort", "low")),
+        effort=settings["effort"],
     )
     return clean_markdown(content)
 
 
+def batch_notes(name: str, rows: list[dict], index: int, total: int) -> str:
+    """Notes from one batch — cheaper than a full persona and nothing is lost to truncation."""
+    settings = _persona_settings()
+    tokens = settings["note_tokens"]
+    note = ""
+    for attempt in (1, 2):
+        note = llm.complete(
+            BATCH_SYSTEM,
+            [{"role": "user", "content": batch_request(name, rows, index, total)}],
+            f"persona-notes-{index}-{attempt}",
+            max_tokens=tokens,
+            temperature=0.6,
+            effort=settings["effort"],
+        ).strip()
+        if not llm.last_truncated or not note:
+            return note
+        tokens *= 2  # cut off mid-note: give it room and try once more
+    return note
+
+
+def merge(name: str, stats: dict, notes: list[str], quotes: list[str],
+          previous: str = "", feedback: str = "") -> str:
+    settings = _persona_settings()
+    content = llm.complete(
+        SYSTEM,
+        [{"role": "user", "content": merge_request(name, stats, notes, quotes, previous, feedback)}],
+        "persona-merge",
+        max_tokens=settings["max_tokens"],
+        temperature=0.8,
+        effort=settings["effort"],
+    )
+    return clean_markdown(content)
+
+
+def total_sample_chars(gathered: dict) -> int:
+    return sum(len(row["text"]) + 2 for rows in gathered["samples"].values() for row in rows)
+
+
+def channel_report(gathered: dict) -> str:
+    """'general-chat 41k · media 12k' — for the over-budget prompt."""
+    parts = []
+    for channel, rows in sorted(gathered["samples"].items(), key=lambda kv: -len(kv[1])):
+        chars = sum(len(r["text"]) + 2 for r in rows)
+        parts.append(f"{channel} {chars // 1000}k")
+    return " · ".join(parts) or "(nothing sampled)"
+
+
+def _notes_path(out: Path) -> Path:
+    return out.parent / ".persona-notes.json"
+
+
+def _load_notes(out: Path, name: str, source: str, count: int) -> list[str] | None:
+    path = _notes_path(out)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if (data.get("author"), data.get("source"), data.get("count")) != (name, source, count):
+        return None
+    notes = [b.get("notes") or "" for b in data.get("batches") or []]
+    return [n for n in notes if n] or None
+
+
+def _save_notes(out: Path, name: str, source: str, count: int, batch_rows: list[list[dict]],
+                notes: list[str]) -> None:
+    path = _notes_path(out)
+    payload = {
+        "author": name,
+        "source": source,
+        "count": count,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "batches": [
+            {"messages": len(rows), "channels": sorted({r.get("channel") or "?" for r in rows}),
+             "notes": note}
+            for rows, note in zip(batch_rows, notes)
+        ],
+    }
+    try:
+        path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    except OSError as exc:
+        print(f"(couldn't cache notes: {exc})")
+
+
+def _ask_channels(gathered: dict, ask, echo) -> bool:
+    """Let them drop channels. True if anything changed."""
+    names = sorted(gathered["samples"])
+    echo(f"channels: {', '.join(names)}")
+    try:
+        reply = ask("drop which? (comma separated, or enter to keep everything) ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if not reply:
+        return False
+    drop = {p.strip().lower().lstrip("#") for p in reply.split(",") if p.strip()}
+    keep = {c: rows for c, rows in gathered["samples"].items() if c.lower().lstrip("#") not in drop}
+    if not keep:
+        echo("that would drop everything — keeping the lot")
+        return False
+    gathered["samples"] = keep
+    return True
+
+
 def interactive(export: Path, who: str | None = None, out: Path | None = None,
-                ask=input, echo=print, assume_yes: bool = False) -> int:
+                ask=input, echo=print, assume_yes: bool = False, fresh: bool = False) -> int:
     """Generate, review, revise, write. Returns 0 when a persona was written."""
     out = out or prompt.persona_path()
+    settings = _persona_settings()
 
     if not export.exists():
         echo(f"no such file or folder: {export}")
         return 1
 
-    messages = style.load(export)
-    if not messages:
-        echo(f"no messages found in {export} (export as DiscordChatExporter JSON)")
-        return 1
-
-    counts = style.authors(messages)
     if who:
-        resolved = style.resolve(messages, who)
-        if not resolved:
+        # one pass: collect() resolves the name itself (username, nickname or id)
+        gathered = style.collect(export, who)
+        name = gathered["name"]
+        if gathered["count"] == 0:
+            counts = style.scan_authors(export)
+            if not counts:
+                echo(f"no messages found in {export} (export as DiscordChatExporter JSON)")
+                return 1
             top = ", ".join(f"{n} ({c})" for n, c in counts.most_common(8))
             echo(f"no messages by {who!r} in those logs. most common authors: {top}")
             return 1
-        name = resolved
     else:
+        counts = style.scan_authors(export)
+        if not counts:
+            echo(f"no messages found in {export} (export as DiscordChatExporter JSON)")
+            return 1
         top = ", ".join(f"{n} ({c})" for n, c in counts.most_common(10))
         echo(f"authors in these logs: {top}")
         try:
@@ -160,15 +337,21 @@ def interactive(export: Path, who: str | None = None, out: Path | None = None,
         except (EOFError, KeyboardInterrupt):
             echo("\ncancelled — nothing written")
             return 1
-        resolved = style.resolve(messages, typed)
-        if not resolved:
+        name = style.resolve_name(counts, typed)
+        if not name:
             echo(f"no messages by {typed!r} in those logs.")
             return 1
-        name = resolved
+        gathered = None
 
-    texts = style.texts_for(messages, name)
-    if len(texts) < 20:
-        echo(f"only {len(texts)} usable messages by {name} — a persona from that will be guesswork.")
+    echo("")
+    echo(f"reading {len(style.files_in(export))} export(s)...")
+    if gathered is None:
+        gathered = style.collect(export, name)
+    if gathered["count"] == 0:
+        echo(f"no usable messages by {name} (empty or link-only)")
+        return 1
+    if gathered["count"] < 20:
+        echo(f"only {gathered['count']} usable messages by {name} — a persona from that will be guesswork.")
         try:
             if ask("carry on anyway? [y/N] ").strip().lower() not in {"y", "yes"}:
                 echo("nothing written")
@@ -177,21 +360,80 @@ def interactive(export: Path, who: str | None = None, out: Path | None = None,
             echo("\ncancelled — nothing written")
             return 1
 
-    s = style.stats(texts)
-    picked = style.samples(texts)
-    echo("")
-    echo(style.summary_line(name, texts))
-    echo(f"reading {s['median_length']}-char median messages, {s['lowercase_start_pct']}% starting lowercase")
-    echo("writing a persona draft... (one model call)")
+    s = style.stats_from(gathered)
+    budget_tokens, window, source = context.budget()
+    budget_chars = int(budget_tokens * style.CHARS_PER_TOKEN)
+    window_text = f"{window} tokens via {source}" if window else "couldn't detect it"
+    years = list(s["years"])
+    span = f"{years[0]}–{years[-1]}" if len(years) > 1 else (years[0] if years else "unknown dates")
+    echo(f"{gathered['count']} messages by {name} ({span})")
+    echo(f"read {gathered['count']} messages, {gathered['chars']} chars, "
+         f"from {len(gathered['channels'])} channel(s)")
+    echo(f"model window: {window_text} → budget {budget_tokens} tokens (~{budget_chars // 1000}k chars)")
 
-    current = draft(name, s, picked)
-    if not current.strip():
-        echo(
-            "the model returned nothing. if it's a reasoning model it may have spent the whole "
-            "token budget thinking — raise [persona] generate_max_tokens in config.toml, "
-            "or check [model] base_url / key."
-        )
-        return 1
+    if total_sample_chars(gathered) > budget_chars and not assume_yes:
+        echo("")
+        echo(f"the sample is bigger than one request's budget: {channel_report(gathered)}")
+        while True:
+            try:
+                reply = ask("batch it across several requests [B] · trim channels [t] · quit [q]: ")
+            except (EOFError, KeyboardInterrupt):
+                echo("\ncancelled — nothing written")
+                return 1
+            low = reply.strip().lower()
+            if low in {"", "b", "batch", "y", "yes"}:
+                break
+            if low in {"t", "trim"}:
+                if not _ask_channels(gathered, ask, echo):
+                    continue
+                if total_sample_chars(gathered) <= budget_chars:
+                    echo("that fits in one request now")
+                    break
+            elif low in {"q", "quit"}:
+                echo("nothing written")
+                return 1
+
+    batches = style.batch_samples(gathered, chars_per_batch=settings["batch_chars"])
+    quotes = style.samples([row for batch in batches for row in batch], limit=12)
+    echo(f"sample: {len(batches)} request(s), {gathered['count']} messages measured")
+
+    notes = None if fresh else _load_notes(out, name, str(export), gathered["count"])
+    if notes:
+        echo(f"reusing cached notes ({len(notes)} batches) from {_notes_path(out).name}")
+        echo("rebuilding the persona from those notes... (one model call)")
+        current = merge(name, s, notes, quotes)
+        if not current.strip():
+            echo(f"couldn't rebuild from the cached notes — delete {_notes_path(out).name} and try again")
+            return 1
+    elif len(batches) == 1:
+        echo("writing a persona draft... (one model call)")
+        current = draft(name, s, [row["text"] for row in batches[0]])
+        if not current.strip():
+            echo(
+                "the model returned nothing. if it's a reasoning model it may have spent the whole "
+                "token budget thinking — raise [persona] generate_max_tokens in config.toml, "
+                "or check [model] base_url / key."
+            )
+            return 1
+    else:
+        notes = []
+        for index, rows in enumerate(batches, 1):
+            echo(f"  batch {index}/{len(batches)}: {len(rows)} messages, "
+                 f"{', '.join(sorted({r.get('channel') or '?' for r in rows}))}")
+            note = batch_notes(name, rows, index, len(batches))
+            if not note:
+                echo(f"  batch {index} came back empty — skipping it")
+                continue
+            notes.append(note)
+        if not notes:
+            echo("no batch returned anything — check [model] in config.toml")
+            return 1
+        _save_notes(out, name, str(export), gathered["count"], batches, notes)
+        echo("merging the notes into a persona... (one model call)")
+        current = merge(name, s, notes, quotes)
+        if not current.strip():
+            echo("the merge came back empty — the cached notes are kept, re-run to retry")
+            return 1
 
     while True:
         echo("")
@@ -220,7 +462,11 @@ def interactive(export: Path, who: str | None = None, out: Path | None = None,
         else:
             feedback = reply
         echo("rewriting...")
-        revised = draft(name, s, picked, previous=current, feedback=feedback)
+        if notes:
+            revised = merge(name, s, notes, quotes, previous=current, feedback=feedback)
+        else:
+            revised = draft(name, s, [row["text"] for row in batches[0]],
+                            previous=current, feedback=feedback)
         if not revised.strip():
             echo("the model returned nothing that time — keeping the previous draft")
             continue

@@ -73,7 +73,7 @@ os.environ["MIAGPT_ENV"] = str(TMP / "does-not-exist.env")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from miagpt import (  # noqa: E402
-    brain, config, llm, memory, persona_gen, prompt, selfcheck, style,
+    brain, config, context, llm, memory, persona_gen, prompt, selfcheck, style,
 )
 
 
@@ -296,6 +296,7 @@ class PersonaGenTests(unittest.TestCase):
     def setUp(self) -> None:
         self.out = TMP / "generated_persona.md"
         self.out.unlink(missing_ok=True)
+        (TMP / ".persona-notes.json").unlink(missing_ok=True)
         self._real_complete = llm.complete
         self.calls: list[dict] = []
 
@@ -370,6 +371,211 @@ class PersonaGenTests(unittest.TestCase):
         existing = TMP / "existing_persona.md"
         existing.write_text("# who you are\nfine.", encoding="utf-8")
         self.assertTrue(persona_gen.bootstrap(existing, echo=lambda *a, **k: None))
+
+
+class ContextTests(unittest.TestCase):
+    """The window probe: config wins, then the three flavours of endpoint, then unknown."""
+
+    class Resp:
+        def __init__(self, data, status=200):
+            self._data = data
+            self.status_code = status
+
+        def json(self):
+            return self._data
+
+    def setUp(self) -> None:
+        self._get = context.requests.get
+        self._post = context.requests.post
+        self.addCleanup(self.restore)
+        self._cfg = config._cache["cfg"]
+
+    def restore(self) -> None:
+        context.requests.get = self._get
+        context.requests.post = self._post
+        if "context_window" in self._cfg.get("model", {}):
+            del self._cfg["model"]["context_window"]
+
+    def test_config_override_wins(self):
+        self._cfg["model"]["context_window"] = 32768
+        self.assertEqual(context.probe(), (32768, "[model] context_window"))
+
+    def test_llamacpp_props(self):
+        context.requests.get = lambda url, **k: self.Resp(
+            {"default_generation_settings": {"n_ctx": 8192}}
+        ) if url.endswith("/props") else self.Resp({}, status=404)
+        self.assertEqual(context.probe(), (8192, "GET /props"))
+
+    def test_openai_style_models_endpoint(self):
+        def get(url, **k):
+            if url.endswith("/models"):
+                return self.Resp({"data": [{"id": "test", "context_length": 200_000}]})
+            return self.Resp({}, status=404)
+
+        context.requests.get = get
+        self.assertEqual(context.probe(), (200_000, "GET /models"))
+
+    def test_llamacpp_router_args_are_parsed(self):
+        def get(url, **k):
+            if url.endswith("/models"):
+                return self.Resp({"data": [{"id": "test", "status": {
+                    "args": ["llama-server", "--ctx-size", "131072"]}}]})
+            return self.Resp({}, status=404)
+
+        context.requests.get = get
+        self.assertEqual(context.probe(), (131072, "GET /models"))
+
+    def test_ollama_show(self):
+        context.requests.get = lambda url, **k: self.Resp({}, status=404)
+        context.requests.post = lambda url, **k: self.Resp(
+            {"model_info": {"general.architecture": "llama", "llama.context_length": 4096}}
+        )
+        self.assertEqual(context.probe(), (4096, "POST /api/show"))
+
+    def test_unknown_is_honest(self):
+        context.requests.get = lambda url, **k: self.Resp({}, status=404)
+        context.requests.post = lambda url, **k: self.Resp({}, status=404)
+        self.assertEqual(context.probe(), (None, "unknown"))
+        self.assertEqual(context.budget(), (100_000, None, "unknown"))
+
+    def test_budget_is_half_the_window_or_the_ceiling(self):
+        self._cfg["model"]["context_window"] = 131072
+        self.assertEqual(context.budget()[0], 65_536)      # half of 131072
+        self._cfg["model"]["context_window"] = 400_000
+        self.assertEqual(context.budget()[0], 100_000)     # capped
+
+
+class CollectTests(unittest.TestCase):
+    def test_streaming_collect_matches_plain_stats(self):
+        gathered = style.collect(EXPORT, "sam")
+        plain = style.stats(style.texts_for(style.load(EXPORT), "sam"))
+        streamed = style.stats_from(gathered)
+        for key in ("count", "median_length", "mean_length", "p90_length",
+                    "lowercase_start_pct", "question_pct", "exclaim_pct", "multiline_pct",
+                    "filler_hits", "top_words", "years"):
+            self.assertEqual(streamed[key], plain[key], key)
+
+    def test_collect_only_keeps_the_named_person(self):
+        gathered = style.collect(EXPORT, "sam")
+        self.assertEqual(gathered["count"], 30)
+        self.assertEqual(gathered["total_seen"], 31)   # everything scanned
+        self.assertEqual(list(gathered["channels"]), ["general"])
+
+    def test_collect_scans_a_folder(self):
+        folder = TMP / "exports"
+        folder.mkdir(exist_ok=True)
+        one = folder / "a.json"
+        two = folder / "b.json"
+        one.write_text(EXPORT.read_text(encoding="utf-8"), encoding="utf-8")
+        data = json.loads(EXPORT.read_text(encoding="utf-8"))
+        data["channel"]["name"] = "second"
+        two.write_text(json.dumps(data), encoding="utf-8")
+        gathered = style.collect(folder, "sam")
+        self.assertEqual(gathered["count"], 60)
+        self.assertEqual(sorted(gathered["channels"]), ["general", "second"])
+
+
+class BatchTests(unittest.TestCase):
+    def test_batches_cover_every_sample_and_respect_the_size(self):
+        gathered = style.collect(EXPORT, "sam")
+        batches = style.batch_samples(gathered, chars_per_batch=400)
+        rows = [row for batch in batches for row in batch]
+        self.assertEqual(len(rows), sum(len(v) for v in gathered["samples"].values()))
+        self.assertGreater(len(batches), 1)
+        for batch in batches:
+            self.assertLessEqual(sum(len(r["text"]) + 2 for r in batch), 400)
+
+    def test_batches_mix_channels(self):
+        gathered = {"samples": {
+            "a": [{"text": "a" * 20, "ts": "2026-01-01", "channel": "a"} for _ in range(5)],
+            "b": [{"text": "b" * 20, "ts": "2026-01-02", "channel": "b"} for _ in range(5)],
+        }}
+        batches = style.batch_samples(gathered, chars_per_batch=200)
+        self.assertTrue(all(len({r["channel"] for r in batch}) == 2 for batch in batches[:-1]))
+
+
+class PersonaGenBatchingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.out = TMP / "batched_persona.md"
+        self.notes = TMP / ".persona-notes.json"
+        self.out.unlink(missing_ok=True)
+        self.notes.unlink(missing_ok=True)
+        self._real_complete = llm.complete
+        self._cfg = config._cache["cfg"]
+        self._persona_cfg = dict(self._cfg.get("persona") or {})
+        self.calls: list[dict] = []
+
+    def tearDown(self) -> None:
+        llm.complete = self._real_complete
+        self.out.unlink(missing_ok=True)
+        self.notes.unlink(missing_ok=True)
+        self._cfg["persona"] = self._persona_cfg
+
+    def fake_model(self, *replies: str):
+        def complete(system, messages, session_id, max_tokens=None, temperature=None, effort=None):
+            self.calls.append({"session": session_id, "messages": messages})
+            return replies[min(len(self.calls) - 1, len(replies) - 1)]
+
+        llm.complete = complete
+
+    def run_gen(self, answers: list[str], **kwargs) -> int:
+        iterator = iter(answers)
+
+        def ask(_="") -> str:
+            return next(iterator)
+
+        return persona_gen.interactive(
+            EXPORT, "sam", self.out, ask=ask, echo=lambda *a, **k: None, **kwargs
+        )
+
+    def test_many_messages_are_batched_then_merged(self):
+        self._cfg["persona"]["batch_characters"] = 300
+        self.fake_model("notes one", "notes two", "notes three", "# who you are\nmerged.")
+        self.assertEqual(self.run_gen(["y"]), 0)
+        batch_calls = [c for c in self.calls if c["session"].startswith("persona-notes")]
+        self.assertGreater(len(batch_calls), 1)
+        self.assertEqual(self.calls[-1]["session"], "persona-merge")
+        self.assertIn("merged", self.out.read_text(encoding="utf-8"))
+        self.assertTrue(self.notes.exists())
+        cached = json.loads(self.notes.read_text(encoding="utf-8"))
+        self.assertEqual(cached["author"], "sam")
+        self.assertGreater(len(cached["batches"]), 1)
+
+    def test_cached_notes_skip_the_batches(self):
+        self._cfg["persona"]["batch_characters"] = 300
+        self.fake_model("notes", "# who you are\nfirst.")
+        self.assertEqual(self.run_gen(["y"]), 0)
+        self.calls.clear()
+        self.fake_model("# who you are\nsecond.")
+        self.assertEqual(self.run_gen(["y"]), 0)
+        self.assertEqual([c["session"] for c in self.calls], ["persona-merge"])
+        self.assertIn("second", self.out.read_text(encoding="utf-8"))
+
+    def test_truncated_notes_are_retried_with_more_room(self):
+        rows = [{"text": "hello there", "ts": "2026-01-01", "channel": "general"}]
+        budget: list[int | None] = []
+        replies = iter(["cut off mid", "full notes about how they type"])
+
+        def complete(system, messages, session_id, max_tokens=None, temperature=None, effort=None):
+            budget.append(max_tokens)
+            llm.last_truncated = len(budget) == 1   # first attempt ran out of tokens
+            return next(replies)
+
+        llm.complete = complete
+        note = persona_gen.batch_notes("sam", rows, 1, 1)
+        self.assertEqual(note, "full notes about how they type")
+        self.assertEqual(len(budget), 2)
+        self.assertGreater(int(budget[1] or 0), int(budget[0] or 0))
+
+    def test_over_budget_asks_and_batches(self):
+        self._cfg["persona"]["batch_characters"] = 300
+        self._cfg["model"]["context_window"] = 400          # 200 token budget ≈ 700 chars
+        try:
+            self.fake_model("notes a", "notes b", "notes c", "# who you are\nbatched.")
+            self.assertEqual(self.run_gen(["b", "y"]), 0)
+        finally:
+            del self._cfg["model"]["context_window"]
+        self.assertIn("batched", self.out.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

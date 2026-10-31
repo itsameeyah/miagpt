@@ -48,6 +48,10 @@ session_header = ""
 # Extra headers sent with every request. Use [model.headers] with nothing under it for none.
 [model.headers]
 
+# How much context this model has, in tokens. Only used to budget persona generation, and only if
+# the API won't tell us (llama.cpp /v1/models, /props, ollama /api/show are all tried first).
+# context_window = 131072
+
 
 [session]
 # One rolling conversation per channel. A gap longer than this starts a fresh one (restart-free).
@@ -94,6 +98,10 @@ generate_max_tokens = 4000
 # Reasoning effort for that one call. "" sends none; not every server accepts the field, and the
 # call is retried without it if the endpoint rejects it.
 generate_reasoning_effort = "low"
+# Bigger log folders get summarised in batches of roughly this many characters per request.
+batch_characters = 28000
+# Token budget for each batch's notes (they're short bullets, not a persona).
+note_max_tokens = 1600
 
 
 [access]

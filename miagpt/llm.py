@@ -14,6 +14,10 @@ log = logging.getLogger("miagpt.llm")
 EMOJI = "\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D"
 TRAILING_EMOJI_RE = re.compile(rf"([{EMOJI}]+)\s*$")
 
+# Set by the last call to complete(), so callers can tell "empty" from "ran out of tokens".
+last_finish = ""
+last_truncated = False
+
 
 def stack_emoji_tail(text: str) -> str:
     """If a reply ends on a single emoji, double it (a lone trailing emoji never happens)."""
@@ -34,6 +38,9 @@ def complete(system: str, messages: list[dict], session_id: str,
 
     `effort` overrides [model] reasoning_effort for this call; pass "" to send none.
     """
+    global last_finish, last_truncated
+    last_finish, last_truncated = "", False
+
     cfg = config.section("model")
     base = (cfg.get("base_url") or "").rstrip("/")
     if not base:
@@ -86,7 +93,11 @@ def complete(system: str, messages: list[dict], session_id: str,
 
     choice = (resp.json().get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
-    if choice.get("finish_reason") == "length":
+
+    last_finish = str(choice.get("finish_reason") or "")
+    last_truncated = last_finish == "length"
+
+    if last_truncated:
         if not content:
             log.warning(
                 "model spent all %s tokens before answering (reasoning model?) — "

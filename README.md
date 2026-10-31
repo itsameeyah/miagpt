@@ -49,6 +49,11 @@ anything else you type is treated as a change request and it rewrites. Same thin
 python tools/persona_from_logs.py --logs ~/exports --person sam
 ```
 
+Point `--logs` at a folder and it reads every export in there. Only that person's messages are sent
+to the model, and if there's more than one request's worth it summarises them in batches first, then
+merges the notes into the persona. If the sample is bigger than half the model's context window (or
+100k tokens, whichever is smaller) it tells you and asks before spending the requests.
+
 Then edit:
 
 | I want to change… | Edit |

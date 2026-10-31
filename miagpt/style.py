@@ -68,8 +68,19 @@ def resolve(messages: list[dict], who: str) -> str | None:
         if name.lower() == wanted:
             return name
     for msg in messages:
-        if msg["id"] == wanted or msg["nick"].lower() == wanted:
+        if msg["id"] == wanted or msg["nick"] == wanted:
             return msg["name"]
+    return resolve_name(counts, wanted)
+
+
+def resolve_name(counts: collections.Counter, who: str) -> str | None:
+    """Same, but from a name -> message count map (streaming path, no messages in memory)."""
+    wanted = who.strip().lstrip("@").lower()
+    if not wanted:
+        return None
+    for name in counts:
+        if name.lower() == wanted:
+            return name
     partial = [name for name in counts if wanted in name.lower()]
     return sorted(partial, key=lambda n: -counts[n])[0] if partial else None
 
@@ -155,3 +166,187 @@ def summary_line(name: str, items: Sequence[str | dict]) -> str:
     stamps = sorted({_stamp(i)[:4] for i in items if _stamp(i)[:4].isdigit()})
     span = f"{stamps[0]}–{stamps[-1]}" if len(stamps) > 1 else (stamps[0] if stamps else "unknown dates")
     return f"{len(items)} messages by {name} ({span})"
+
+
+# --------------------------------------------------------------------------------------------
+# Streaming collection: a folder of exports can be hundreds of MB, and we only ever want one
+# person's lines. Everything below keeps bounded memory and exact aggregates.
+# --------------------------------------------------------------------------------------------
+
+CHARS_PER_TOKEN = 3.5  # rough for English chat; used only for budgeting, never for billing
+
+
+def estimate_tokens(chars: int) -> int:
+    return int(chars / CHARS_PER_TOKEN) + 1
+
+
+def files_in(path: Path) -> list[Path]:
+    """One export, or every .json in a folder."""
+    return [path] if path.is_file() else sorted(path.glob("*.json"))
+
+
+def scan_authors(path: Path) -> collections.Counter:
+    """Author -> message count, without holding the exports in memory."""
+    counts: collections.Counter = collections.Counter()
+    for file in files_in(path):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        for msg in data.get("messages") or []:
+            name = (msg.get("author") or {}).get("name")
+            if name:
+                counts[name] += 1
+    return counts
+
+
+def collect(path: Path, name: str, per_channel_cap: int = 400) -> dict:
+    """Stream the exports, keep only `name`'s messages, aggregate as we go.
+
+    `name` can be a username, a nickname or a user id — the first author that matches wins and is
+    reported back in ``gathered["name"]``.
+
+    Returns exact counts plus a bounded per-channel sample of that person's messages.
+    """
+    wanted = name.strip().lstrip("@").lower()
+    matched: str | None = None
+
+    def is_target(author: dict) -> bool:
+        return (
+            (author.get("name") or "").lower() == wanted
+            or str(author.get("id") or "") == wanted
+            or (author.get("nickname") or "").lower() == wanted
+        )
+
+    rng = random.Random(7)
+    samples: dict[str, list[dict]] = collections.defaultdict(list)
+    seen_per_channel: collections.Counter = collections.Counter()
+    channels: collections.Counter = collections.Counter()
+    years: collections.Counter = collections.Counter()
+    words: collections.Counter = collections.Counter()
+    emoji: collections.Counter = collections.Counter()
+    contractions = {f"{s}/{long}": [0, 0] for s, long in CONTRACTIONS}
+    counts = {"total": 0, "kept": 0, "chars": 0, "lowercase": 0, "question": 0,
+              "fullstop": 0, "exclaim": 0, "multiline": 0, "filler": 0}
+    lengths: list[int] = []
+    files = files_in(path)
+
+    for file in files:
+        try:
+            data = json.loads(file.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        channel = (data.get("channel") or {}).get("name") or file.stem
+        for msg in data.get("messages") or []:
+            author = msg.get("author") or {}
+            if not author.get("name"):
+                continue
+            counts["total"] += 1
+            if not is_target(author):
+                continue
+            matched = matched or author["name"]
+            text = (msg.get("content") or "").strip()
+            if not text or URL.sub("", text).strip() == "":
+                continue
+            ts = msg.get("timestamp") or ""
+            counts["kept"] += 1
+            counts["chars"] += len(text)
+            counts["lowercase"] += 1 if text[:1].islower() else 0
+            counts["question"] += 1 if "?" in text else 0
+            counts["fullstop"] += 1 if "." in text else 0
+            counts["exclaim"] += 1 if "!" in text else 0
+            counts["multiline"] += 1 if "\n" in text else 0
+            counts["filler"] += len(FILLER.findall(text))
+            channels[channel] += 1
+            years[ts[:4]] += 1
+            lengths.append(len(text))
+            words.update(w for w in WORD.findall(text.lower()) if w not in STOP)
+            emoji.update(ch for ch in text if ord(ch) > 0x2000)
+            for short, long in CONTRACTIONS:
+                key = f"{short}/{long}"
+                contractions[key][0] += len(re.findall(rf"\b{re.escape(short)}\b", text, re.I))
+                contractions[key][1] += len(re.findall(re.escape(long), text, re.I))
+
+            # bounded reservoir per channel, so a huge channel can't swamp the sample
+            bucket = samples[channel]
+            seen_per_channel[channel] += 1
+            seen = seen_per_channel[channel]
+            if len(bucket) < per_channel_cap:
+                bucket.append({"text": text, "ts": ts, "channel": channel})
+            else:
+                j = rng.randrange(seen)
+                if j < per_channel_cap:
+                    bucket[j] = {"text": text, "ts": ts, "channel": channel}
+
+    return {
+        "name": matched or name,
+        "files": len(files),
+        "count": counts["kept"],
+        "total_seen": counts["total"],
+        "chars": counts["chars"],
+        "lengths": lengths,
+        "punctuation": {k: counts[k] for k in ("lowercase", "question", "fullstop", "exclaim", "multiline")},
+        "filler_hits": counts["filler"],
+        "words": words,
+        "emoji": emoji,
+        "contractions": contractions,
+        "channels": channels,
+        "years": +years,
+        "samples": {ch: rows for ch, rows in samples.items() if rows},
+    }
+
+
+def stats_from(gathered: dict) -> dict:
+    """The same shape as stats(), built from a collect() result."""
+    n = gathered["count"]
+    lengths = sorted(gathered["lengths"])
+    p = gathered["punctuation"]
+    pct = (lambda value: round(100 * value / n)) if n else (lambda value: 0)
+    return {
+        "count": n,
+        "median_length": int(statistics.median(lengths)) if lengths else 0,
+        "mean_length": round(statistics.mean(lengths)) if lengths else 0,
+        "p90_length": lengths[int(len(lengths) * 0.9)] if lengths else 0,
+        "lowercase_start_pct": pct(p["lowercase"]),
+        "question_pct": pct(p["question"]),
+        "fullstop_pct": pct(p["fullstop"]),
+        "exclaim_pct": pct(p["exclaim"]),
+        "multiline_pct": pct(p["multiline"]),
+        "top_words": [w for w, _ in gathered["words"].most_common(25)],
+        "emoji": [(ch, c) for ch, c in gathered["emoji"].most_common(12)],
+        "contractions": {k: tuple(v) for k, v in gathered["contractions"].items()},
+        "filler_hits": gathered["filler_hits"],
+        "years": dict(sorted((y, c) for y, c in gathered["years"].items() if y)),
+    }
+
+
+def batch_samples(gathered: dict, chars_per_batch: int = 28_000) -> list[list[dict]]:
+    """Split the collected sample into batches small enough for one request.
+
+    Round-robin across channels so every batch sees a mix instead of one loud channel.
+    """
+    queues = {}
+    for channel, rows in gathered["samples"].items():
+        rows = sorted(rows, key=lambda r: r["ts"])
+        queues[channel] = list(rows)
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    used = 0
+    while any(queues.values()):
+        for channel in list(queues):
+            queue = queues[channel]
+            if not queue:
+                continue
+            row = queue.pop(0)
+            size = len(row["text"]) + 2
+            if current and used + size > chars_per_batch:
+                batches.append(current)
+                current, used = [], 0
+            current.append(row)
+            used += size
+        if not any(queues.values()) and current:
+            batches.append(current)
+            current, used = [], 0
+    if current:
+        batches.append(current)
+    return batches

@@ -5,6 +5,7 @@ memory.tmp
 
 # your persona is private by default; the repo ships persona.example.md
 persona.md
+.persona-notes.json
 
 # generated from chat exports — other people's messages, keep them local
 people/
