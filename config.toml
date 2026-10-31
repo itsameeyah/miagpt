@@ -1,0 +1,107 @@
+# miagpt config — everything you're likely to tweak lives here.
+# Changes reload while the bot is running unless marked (restart).
+# This file is TOML: strings in quotes, lists in [brackets], one [[canned]] block per canned reply.
+
+[bot]
+# What the bot calls itself. Keeps it from looking itself up as if it were a person.
+name = "miagpt"
+# Other names that also mean the bot (your old usernames here if you want).
+aliases = []
+# The slash command's name and description, as they appear in Discord.
+command = "ask"
+description = "ask the ai version of me something"
+# Shown above every answer as Discord subtext ("-# <display name> asked: <question>").
+header = "-# {display} asked: {text}"
+# Max characters of a question echoed in that header before it gets truncated.
+header_question_limit = 300
+# Shown when someone isn't on the allowlist.
+not_allowed = "this one's not for you sorry"
+# Shown when the model call fails.
+error_reply = "something broke on my end, try again in a sec"
+# Shown when the model comes back with nothing usable.
+empty_reply = "idk i got nothing for that one"
+# Shown when it's asked about someone and there's no digest for them ({name} is what they asked about).
+unknown_person = "idk i dont really know {name} tbh"
+# Shown when it asks for older memories and there still isn't anything useful.
+nothing_saved = "idk i checked my notes and theres nothing useful in there"
+
+
+[model]
+# Any OpenAI-compatible /chat/completions endpoint:
+#   llama.cpp    -> http://127.0.0.1:8080/v1
+#   ollama       -> http://127.0.0.1:11434/v1
+#   lm studio    -> http://127.0.0.1:1234/v1
+#   openrouter   -> https://openrouter.ai/api/v1
+#   openai       -> https://api.openai.com/v1
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen3"
+max_tokens = 400
+temperature = 1.0
+# Some models accept "minimal"/"low"/"medium"/"high"; delete the line for endpoints that don't.
+# reasoning_effort = "minimal"
+timeout_seconds = 45
+# API key: read from this env var (or from .env). Leave empty for a local model.
+api_key_env = "MIAGPT_API_KEY"
+# Optional: a header some providers use to keep a prompt cache per conversation.
+# e.g. opencode go uses "x-opencode-session". Leave empty to send nothing.
+session_header = ""
+# Extra headers sent with every request. Use [model.headers] with nothing under it for none.
+[model.headers]
+
+
+[session]
+# One rolling conversation per channel. A gap longer than this starts a fresh one (restart-free).
+minutes_between_messages = 15
+# How many exchanges (question + answer) to keep in that conversation.
+turns = 6
+# Hard cap on channels tracked in memory before the oldest are dropped.
+max_channels = 500
+
+
+[memory]
+# A plain jsonl file the bot writes itself with <remember> tags. Keep it out of git.
+enabled = true
+file = "memory.jsonl"
+# How much of it is pasted into the system prompt (newest first).
+inject_characters = 4000
+# Hard ceiling for the file itself; oldest entries are dropped past this.
+max_file_characters = 10000
+# Longest single saved note.
+max_entry_characters = 300
+
+
+[people]
+# Optional: digests of real people built by tools/people_index.py. Leave false if you don't have logs.
+enabled = false
+directory = "people"
+# Characters of a person's digest pasted into the prompt.
+characters = 3200
+# How many people one message can pull in.
+max_per_message = 2
+# Names that must never be looked up (old names someone no longer uses, etc).
+blocked = []
+# Names that are actually you, the bot's owner — never looked up as separate people.
+self = []
+
+
+[persona]
+# The system prompt itself, kept as markdown so it's easy to rewrite. Hot reloads.
+# This file is NOT in the repo: copy persona.example.md to persona.md to start.
+file = "persona.md"
+
+
+[access]
+# Discord user ids allowed to use the command. Empty list = everyone who can see it.
+# Turn on Developer Mode in Discord settings, then right-click a name -> Copy User ID.
+allowed_users = []
+
+
+# Fixed answers, matched on the whole message (case and punctuation ignored).
+# Not sent to the model, so they always come out identical. Delete the blocks you don't want.
+[[canned]]
+when = ["what day is it today", "what day is it", "whats the date today"]
+reply = "no idea, i don't do calendars"
+
+[[canned]]
+when = ["are you a bot", "are you real", "is this ai"]
+reply = "im an ai version of me. she made me for the bit"

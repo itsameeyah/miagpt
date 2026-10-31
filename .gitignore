@@ -1,0 +1,23 @@
+# secrets and local state — never commit these
+.env
+memory.jsonl
+memory.tmp
+
+# your persona is private by default; the repo ships persona.example.md
+persona.md
+
+# generated from chat exports — other people's messages, keep them local
+people/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# editors / os
+.DS_Store
+.vscode/
+.idea/
+*.bak
