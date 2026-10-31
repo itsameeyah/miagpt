@@ -49,6 +49,11 @@ def persona_path():
     return config.path_for(config.section("persona").get("file") or "persona.md")
 
 
+def reset() -> None:
+    """Forget the cached persona text, so the next build() re-reads the file."""
+    _cache.update({"mtime": -1.0, "text": ""})
+
+
 def build(context: str, who: str, memory_text: str, omitted: int, people_section: str) -> str:
     """Assemble the full system prompt for one message."""
     memory_block = memory_text or "(nothing saved yet)"

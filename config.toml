@@ -88,6 +88,12 @@ self = []
 # The system prompt itself, kept as markdown so it's easy to rewrite. Hot reloads.
 # This file is NOT in the repo: copy persona.example.md to persona.md to start.
 file = "persona.md"
+# Token budget for tools/persona_from_logs.py when it writes a persona from chat logs.
+# Reasoning models burn most of this before they answer, so don't make it smaller.
+generate_max_tokens = 4000
+# Reasoning effort for that one call. "" sends none; not every server accepts the field, and the
+# call is retried without it if the endpoint rejects it.
+generate_reasoning_effort = "low"
 
 
 [access]

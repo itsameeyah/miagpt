@@ -127,10 +127,16 @@ def main() -> None:
             "(see .env.example) and start again."
         )
     path = prompt.persona_path()
-    if not path.exists():
-        raise SystemExit(
-            f"No persona file at {path}.\n"
-            "Copy persona.example.md to persona.md, write your version, then start again:\n"
-            f"  cp persona.example.md {path.name}"
-        )
+    if not path.exists() or not prompt.persona().strip():
+        log.info("no persona at %s — offering to build one from logs", path)
+        from . import persona_gen
+
+        if not persona_gen.bootstrap(path):
+            raise SystemExit(
+                f"No persona file at {path}.\n"
+                "Either build one from exported logs:\n"
+                "  python tools/persona_from_logs.py\n"
+                "or start from the template and edit it:\n"
+                f"  cp persona.example.md {path.name}"
+            )
     Miagpt().run(token, log_handler=None)

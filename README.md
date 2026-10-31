@@ -41,6 +41,14 @@ cp .env.example .env                      # paste your bot token in here
 cp persona.example.md persona.md          # write the personality here
 ```
 
+No persona yet? Skip the second line: on first start the bot asks for a folder of exported chat
+logs, picks out one person's messages, writes a persona from them and prints it. `y` keeps it;
+anything else you type is treated as a change request and it rewrites. Same thing on demand:
+
+```bash
+python tools/persona_from_logs.py --logs ~/exports --person sam
+```
+
 Then edit:
 
 | I want to change… | Edit |
@@ -127,7 +135,7 @@ Export a channel with [DiscordChatExporter](https://github.com/Tyrrrz/DiscordCha
 
 ```bash
 python tools/people_index.py --logs ~/path/to/exports
-python tools/analyze_style.py export.json their_username    # numbers for persona.md's typing section
+python tools/analyze_style.py export.json their_username    # the typing numbers on their own
 ```
 
 Set `[people] enabled = true` to use them. `[people] blocked` hides names that must never surface,

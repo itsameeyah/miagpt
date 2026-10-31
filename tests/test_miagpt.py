@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -71,7 +72,9 @@ os.environ["MIAGPT_CONFIG"] = str(CONFIG)
 os.environ["MIAGPT_ENV"] = str(TMP / "does-not-exist.env")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from miagpt import brain, config, llm, memory, prompt, selfcheck  # noqa: E402
+from miagpt import (  # noqa: E402
+    brain, config, llm, memory, persona_gen, prompt, selfcheck, style,
+)
 
 
 class AnswerTests(unittest.TestCase):
@@ -223,6 +226,150 @@ class SelfcheckTests(unittest.TestCase):
             os.environ.pop("MIAGPT_DISCORD_TOKEN", None)
         self.assertEqual(code, 0, output)
         self.assertIn("looks good", output)
+
+
+EXPORT = TMP / "export.json"
+EXPORT.write_text(json.dumps({
+    "channel": {"name": "general"},
+    "messages": [
+        *[
+            {
+                "author": {"name": "sam", "nickname": "sammers", "id": "42"},
+                "timestamp": f"2026-01-{i % 28 + 1:02d}T12:00:00+00:00",
+                "content": f"hello there number {i}, this is a test message of mine",
+            }
+            for i in range(30)
+        ],
+        {
+            "author": {"name": "other", "nickname": "", "id": "43"},
+            "timestamp": "2026-01-03T12:00:00+00:00",
+            "content": "not sam talking",
+        },
+    ],
+}), encoding="utf-8")
+
+
+class StyleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.messages = style.load(EXPORT)
+
+    def test_resolves_name_nickname_and_id(self):
+        self.assertEqual(style.resolve(self.messages, "sam"), "sam")
+        self.assertEqual(style.resolve(self.messages, "@SAM"), "sam")
+        self.assertEqual(style.resolve(self.messages, "42"), "sam")
+        self.assertEqual(style.resolve(self.messages, "sammers"), "sam")
+        self.assertIsNone(style.resolve(self.messages, "nobody"))
+
+    def test_texts_are_only_that_person(self):
+        texts = style.texts_for(self.messages, "sam")
+        self.assertEqual(len(texts), 30)
+        self.assertTrue(all("not sam" not in t["text"] for t in texts))
+        self.assertTrue(all(t["ts"].startswith("2026-01") for t in texts))
+
+    def test_drops_link_only_messages(self):
+        messages = [
+            {"name": "sam", "content": "https://example.com", "ts": "", "id": "", "nick": "", "channel": ""},
+            {"name": "sam", "content": "have a look https://example.com", "ts": "", "id": "", "nick": "", "channel": ""},
+        ]
+        self.assertEqual(len(style.texts_for(messages, "sam")), 1)
+
+    def test_stats_are_measured_not_guessed(self):
+        s = style.stats(["hello there friend", "HI THIS IS SHOUTING"])
+        self.assertEqual(s["count"], 2)
+        self.assertEqual(s["median_length"], 18)
+        self.assertEqual(s["lowercase_start_pct"], 50)
+        self.assertEqual(s["exclaim_pct"], 0)
+
+    def test_dates_come_from_timestamps_not_message_text(self):
+        items = style.texts_for(self.messages, "sam")
+        s = style.stats(items)
+        self.assertEqual(list(s["years"]), ["2026"])
+        self.assertIn("2026", style.summary_line("sam", items))
+
+    def test_samples_are_unique_and_capped(self):
+        picked = style.samples(style.texts_for(self.messages, "sam"), limit=5)
+        self.assertEqual(len(picked), 5)
+        self.assertEqual(len(set(picked)), 5)
+
+
+class PersonaGenTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.out = TMP / "generated_persona.md"
+        self.out.unlink(missing_ok=True)
+        self._real_complete = llm.complete
+        self.calls: list[dict] = []
+
+    def tearDown(self) -> None:
+        llm.complete = self._real_complete
+        self.out.unlink(missing_ok=True)
+
+    def fake_model(self, *replies: str):
+        def complete(system, messages, session_id, max_tokens=None, temperature=None, effort=None):
+            self.calls.append({"system": system, "messages": messages,
+                               "max_tokens": max_tokens, "effort": effort})
+            return replies[min(len(self.calls) - 1, len(replies) - 1)]
+
+        llm.complete = complete
+
+    def run_gen(self, answers: list[str], **kwargs) -> int:
+        iterator = iter(answers)
+
+        def ask(_="") -> str:
+            return next(iterator)
+
+        return persona_gen.interactive(
+            EXPORT, "sam", self.out, ask=ask, echo=lambda *a, **k: None, **kwargs
+        )
+
+    def test_clean_markdown_strips_fences_and_preamble(self):
+        messy = "Sure! Here's the file:\n```markdown\n# who you are\nyou are x.\n```"
+        self.assertEqual(persona_gen.clean_markdown(messy), "# who you are\nyou are x.\n")
+
+    def test_draft_asks_for_a_long_enough_reply(self):
+        self.fake_model("# who you are\nhatted.")
+        persona_gen.draft("sam", style.stats(style.texts_for(style.load(EXPORT), "sam")), ["hi"])
+        self.assertEqual(self.calls[0]["max_tokens"], 4000)
+        self.assertEqual(self.calls[0]["effort"], "low")
+        request = self.calls[0]["messages"][0]["content"]
+        self.assertIn("testbot", request)   # bot name comes from [bot] name
+        self.assertIn("sam", request)
+        self.assertIn("hi", request)        # example messages are included
+        self.assertIn("median", request)    # and the measured stats
+
+    def test_accepting_writes_the_persona(self):
+        self.fake_model("# who you are\nyou are sambot.")
+        self.assertEqual(self.run_gen(["y"]), 0)
+        self.assertIn("you are sambot", self.out.read_text(encoding="utf-8"))
+
+    def test_yes_flag_skips_the_question(self):
+        self.fake_model("# who you are\nyou are sambot.")
+        self.assertEqual(self.run_gen([], assume_yes=True), 0)
+        self.assertTrue(self.out.exists())
+
+    def test_revision_is_sent_back_to_the_model(self):
+        self.fake_model("# who you are\nfirst try.", "# who you are\nsecond try.")
+        self.assertEqual(self.run_gen(["make it meaner", "y"]), 0)
+        self.assertEqual(len(self.calls), 2)
+        second_request = self.calls[1]["messages"][0]["content"]
+        self.assertIn("make it meaner", second_request)
+        self.assertIn("first try", second_request)
+        self.assertIn("second try", self.out.read_text(encoding="utf-8"))
+
+    def test_quitting_writes_nothing(self):
+        self.fake_model("# who you are\nnope.")
+        self.assertEqual(self.run_gen(["q"]), 1)
+        self.assertFalse(self.out.exists())
+
+    def test_unknown_person_writes_nothing(self):
+        self.fake_model("# who you are\nnope.")
+        code = persona_gen.interactive(EXPORT, "ghost", self.out, ask=input, echo=lambda *a, **k: None)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.out.exists())
+
+    def test_bootstrap_is_a_no_op_when_a_persona_exists(self):
+        existing = TMP / "existing_persona.md"
+        existing.write_text("# who you are\nfine.", encoding="utf-8")
+        self.assertTrue(persona_gen.bootstrap(existing, echo=lambda *a, **k: None))
 
 
 if __name__ == "__main__":

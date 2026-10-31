@@ -27,8 +27,13 @@ def stack_emoji_tail(text: str) -> str:
     return text[: match.start()] + run * 2 + text[match.end():]
 
 
-def complete(system: str, messages: list[dict], session_id: str) -> str:
-    """One chat completion. Returns "" on failure (the caller has a fallback line)."""
+def complete(system: str, messages: list[dict], session_id: str,
+             max_tokens: int | None = None, temperature: float | None = None,
+             effort: str | None = None) -> str:
+    """One chat completion. Returns "" on failure (the caller has a fallback line).
+
+    `effort` overrides [model] reasoning_effort for this call; pass "" to send none.
+    """
     cfg = config.section("model")
     base = (cfg.get("base_url") or "").rstrip("/")
     if not base:
@@ -48,21 +53,32 @@ def complete(system: str, messages: list[dict], session_id: str) -> str:
     payload = {
         "model": cfg.get("model"),
         "messages": [{"role": "system", "content": system}, *messages],
-        "max_tokens": int(cfg.get("max_tokens", 400)),
-        "temperature": float(cfg.get("temperature", 1.0)),
+        "max_tokens": int(max_tokens if max_tokens is not None else cfg.get("max_tokens", 400)),
+        "temperature": float(temperature if temperature is not None else cfg.get("temperature", 1.0)),
     }
-    if cfg.get("reasoning_effort"):
-        payload["reasoning_effort"] = cfg["reasoning_effort"]
+    wanted = cfg.get("reasoning_effort") if effort is None else effort
+    if wanted:
+        payload["reasoning_effort"] = wanted
 
-    try:
-        resp = requests.post(
-            f"{base}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=float(cfg.get("timeout_seconds", 45)),
-        )
-    except requests.RequestException as exc:
-        log.warning("api request failed: %s", exc)
+    def post() -> requests.Response | None:
+        try:
+            return requests.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=float(cfg.get("timeout_seconds", 45)),
+            )
+        except requests.RequestException as exc:
+            log.warning("api request failed: %s", exc)
+            return None
+
+    resp = post()
+    if resp is not None and resp.status_code != 200 and payload.get("reasoning_effort"):
+        # not every OpenAI-compatible server knows the field; try once without it
+        log.info("retrying without reasoning_effort after HTTP %s", resp.status_code)
+        payload.pop("reasoning_effort", None)
+        resp = post()
+    if resp is None:
         return ""
     if resp.status_code != 200:
         log.warning("api %s: %s", resp.status_code, resp.text[:300])
@@ -71,6 +87,13 @@ def complete(system: str, messages: list[dict], session_id: str) -> str:
     choice = (resp.json().get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
     if choice.get("finish_reason") == "length":
+        if not content:
+            log.warning(
+                "model spent all %s tokens before answering (reasoning model?) — "
+                "raise max_tokens or lower reasoning_effort",
+                payload["max_tokens"],
+            )
+            return ""
         # out of tokens mid-sentence: drop the dangling fragment instead of posting half a word
         cut = max(content.rfind("."), content.rfind("?"), content.rfind("!"), content.rfind(","))
         content = content[:cut].rstrip() if cut > 0 else content.rsplit(" ", 1)[0]

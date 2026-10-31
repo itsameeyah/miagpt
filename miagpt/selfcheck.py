@@ -50,7 +50,7 @@ def run(probe: bool = True) -> int:
             lines.append(_line(OK, "persona.md", f"{size} chars"))
     else:
         failures += 1
-        lines.append(_line(BAD, "persona.md", f"missing — copy persona.example.md to {path.name}"))
+        lines.append(_line(BAD, "persona.md", "missing — run tools/persona_from_logs.py, or copy the example"))
 
     # 3. token
     token = config.discord_token()

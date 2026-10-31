@@ -1,96 +1,71 @@
 #!/usr/bin/env python3
-"""analyze_style.py — measure how someone types, so the persona file can describe it accurately.
+"""analyze_style.py — measure how someone types, so a persona can describe it accurately.
 
-Usage:
     python tools/analyze_style.py export.json <discord username> [--since 2026-01]
 
-Reads one DiscordChatExporter JSON export (or the output of dce_html_to_json.py) and prints, for
-that author: message count, median/mean length, punctuation habits, which contractions they drop,
-their most common words and their most-used emoji. Copy the interesting numbers into the persona's
-"how you type" section.
-
-No network, no model calls, read-only.
+Reads a DiscordChatExporter JSON export (or the output of dce_html_to_json.py) and prints, for that
+author: message count, median length, punctuation habits, which contractions they drop, their most
+common words and their most-used emoji. Copy the numbers into the persona's "how you type" section,
+or skip this and let tools/persona_from_logs.py write the whole file.
 """
 
 from __future__ import annotations
 
 import argparse
-import collections
-import json
-import re
-import statistics
 import sys
 from pathlib import Path
 
-STOP = {
-    "the", "a", "i", "to", "and", "it", "is", "of", "that", "in", "you", "me", "my", "for", "so",
-    "on", "but", "was", "have", "this", "be", "with", "your", "its", "im",
-}
-CONTRACTIONS = [("im", "i'm"), ("dont", "don't"), ("cant", "can't"), ("thats", "that's"),
-                ("whats", "what's"), ("ill", "i'll"), ("youre", "you're"), ("its", "it's")]
-FILLER = r"\b(r u|u|ur|idk|rn|lol|tbh|ngl|bc|ty|omg|fr|mhm)\b"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from miagpt import style  # noqa: E402
 
 
-def stats(name: str, rows: list[str]) -> None:
-    lengths = [len(c) for c in rows]
-    joined = " ".join(rows)
-    lowercase = sum(1 for c in rows if c[:1].islower())
-    questions = sum(1 for c in rows if "?" in c)
-    fullstops = sum(1 for c in rows if "." in c)
-    exclaims = sum(1 for c in rows if "!" in c)
-    print(f"\n[{name}] n={len(rows)} median={statistics.median(lengths):.0f} "
-          f"mean={statistics.mean(lengths):.0f} p90={sorted(lengths)[int(len(lengths) * 0.9)]}")
-    print(f"  lowercase start {lowercase * 100 // len(rows)}% | ? {questions * 100 // len(rows)}% "
-          f"| . {fullstops * 100 // len(rows)}% | ! {exclaims * 100 // len(rows)}%")
-    apostrophes = {
-        short: len(re.findall(rf"\b{re.escape(short)}\b", joined, re.I))
-        for short, _ in CONTRACTIONS
-    }
-    apostrophes.update({
-        long: len(re.findall(re.escape(long), joined, re.I)) for _, long in CONTRACTIONS
-    })
-    print("  apostrophes:", apostrophes)
-    words = re.findall(r"[a-z']{2,}", joined.lower())
-    top = collections.Counter(w for w in words if w not in STOP).most_common(22)
-    print("  top words:", ", ".join(f"{w}({n})" for w, n in top))
-    print("  filler:", len(re.findall(FILLER, joined, re.I)), "hits")
-    emoji = collections.Counter(ch for c in rows for ch in c if ord(ch) > 0x2000)
-    print("  emoji:", ", ".join(f"{ch}({n})" for ch, n in emoji.most_common(12)))
+def show(label: str, items: list[dict]) -> None:
+    s = style.stats(items)
+    emoji = ", ".join(f"{ch} x{n}" for ch, n in s["emoji"]) or "(none)"
+    drops = "; ".join(
+        f'"{pair.split("/")[0]}" {counts[0]} vs "{pair.split("/")[1]}" {counts[1]}'
+        for pair, counts in s["contractions"].items()
+        if sum(counts) >= 5
+    )
+    print(f"\n[{label}]")
+    print(f"  n={s['count']}  median={s['median_length']}  mean={s['mean_length']}  p90={s['p90_length']}")
+    print(f"  lowercase start {s['lowercase_start_pct']}% | ? {s['question_pct']}% "
+          f"| . {s['fullstop_pct']}% | ! {s['exclaim_pct']}% | multiline {s['multiline_pct']}%")
+    print(f"  contractions: {drops or '(none notable)'}")
+    print(f"  filler hits: {s['filler_hits']}")
+    print(f"  top words: {', '.join(s['top_words'][:20])}")
+    print(f"  emoji: {emoji}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("export", type=Path, help="DiscordChatExporter json export")
     ap.add_argument("username", help="the author to measure")
-    ap.add_argument("--since", default="", help="only messages after this ISO date, e.g. 2026-01")
+    ap.add_argument("--since", default="", help="only count messages after this ISO date, e.g. 2026-01")
     args = ap.parse_args()
 
-    try:
-        data = json.loads(args.export.read_text(encoding="utf-8", errors="replace"))
-    except Exception as exc:
-        print(f"can't read {args.export}: {exc}", file=sys.stderr)
+    messages = style.load(args.export)
+    if not messages:
+        print(f"no messages in {args.export}", file=sys.stderr)
         return 2
 
-    rows = [
-        m["content"] for m in data.get("messages") or []
-        if (m.get("author") or {}).get("name") == args.username
-        and (m.get("content") or "").strip()
-        and not m["content"].startswith("http")
-        and (not args.since or (m.get("timestamp") or "") >= args.since)
-    ]
-    if not rows:
-        print(f"no messages by {args.username} in {args.export}", file=sys.stderr)
+    name = style.resolve(messages, args.username)
+    if not name:
+        top = ", ".join(f"{n} ({c})" for n, c in style.authors(messages).most_common(8))
+        print(f"no author matching {args.username!r}. in there: {top}", file=sys.stderr)
         return 1
 
-    print(f"messages: {len(rows)}")
-    by_year: dict[str, list[str]] = collections.defaultdict(list)
-    for m in data["messages"]:
-        if (m.get("author") or {}).get("name") == args.username and (m.get("content") or "").strip():
-            by_year[(m.get("timestamp") or "")[:4]].append(m["content"])
-    for year in sorted(by_year):
-        print(f"  {year}: {len(by_year[year])}")
+    items = style.texts_for(messages, name)
+    if args.since:
+        items = [i for i in items if i["ts"] >= args.since]
+    if not items:
+        print(f"no messages by {name} after {args.since}", file=sys.stderr)
+        return 1
 
-    stats("all" if not args.since else f"since {args.since}", rows)
+    print(style.summary_line(name, items))
+    show("all" if not args.since else f"since {args.since}", items)
+    print("\nwant a whole persona written from this?  python tools/persona_from_logs.py")
     return 0
 
 
