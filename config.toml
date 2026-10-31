@@ -45,12 +45,11 @@ api_key_env = "MIAGPT_API_KEY"
 # Optional: a header some providers use to keep a prompt cache per conversation.
 # e.g. opencode go uses "x-opencode-session". Leave empty to send nothing.
 session_header = ""
-# Extra headers sent with every request. Use [model.headers] with nothing under it for none.
-[model.headers]
-
 # How much context this model has, in tokens. Only used to budget persona generation, and only if
 # the API won't tell us (llama.cpp /v1/models, /props, ollama /api/show are all tried first).
 # context_window = 131072
+# Extra headers sent with every request. Use [model.headers] with nothing under it for none.
+[model.headers]
 
 
 [session]
