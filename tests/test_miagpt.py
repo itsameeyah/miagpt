@@ -71,7 +71,7 @@ os.environ["MIAGPT_CONFIG"] = str(CONFIG)
 os.environ["MIAGPT_ENV"] = str(TMP / "does-not-exist.env")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from miagpt import brain, config, llm, memory, prompt  # noqa: E402
+from miagpt import brain, config, llm, memory, prompt, selfcheck  # noqa: E402
 
 
 class AnswerTests(unittest.TestCase):
@@ -191,6 +191,38 @@ class ConfigTests(unittest.TestCase):
 
     def test_missing_placeholder_is_left_alone(self):
         self.assertEqual(config.reply("unknown_person", "?", other="sam"), "who is {name}")
+
+
+class SelfcheckTests(unittest.TestCase):
+    def report(self) -> tuple[int, str]:
+        import io
+        from contextlib import redirect_stdout
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = selfcheck.run(probe=False)
+        return code, buffer.getvalue()
+
+    def test_missing_token_is_reported(self):
+        import os
+
+        os.environ.pop("MIAGPT_DISCORD_TOKEN", None)
+        code, output = self.report()
+        self.assertEqual(code, 1)
+        self.assertIn("bot token", output)
+        self.assertIn("config.toml", output)
+        self.assertIn("persona.md", output)
+
+    def test_ready_install_passes(self):
+        import os
+
+        os.environ["MIAGPT_DISCORD_TOKEN"] = "fake-token-value-1234"
+        try:
+            code, output = self.report()
+        finally:
+            os.environ.pop("MIAGPT_DISCORD_TOKEN", None)
+        self.assertEqual(code, 0, output)
+        self.assertIn("looks good", output)
 
 
 if __name__ == "__main__":

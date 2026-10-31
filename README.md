@@ -25,13 +25,16 @@ miagpt/
   llm.py                one chat completion + reply clean-up
   brain.py              the answer pipeline (testable without Discord)
   app.py                Discord wiring, /ask command
+  selfcheck.py          `bot.py --check`: is this install ready to start?
 tools/
   people_index.py       build people digests from DiscordChatExporter json
   digest.py             quick stats over exported logs
   dce_html_to_json.py   convert an HTML export to json
   analyze_style.py      measure how someone types, for the persona file
 tests/                  offline tests (no Discord, no network, no model)
-install.sh              systemd user service, with a venv
+install.sh              optional: systemd user service (Linux)
+run.sh                  start it in this terminal (macOS / Linux)
+run.bat                 same, for Windows (double-clickable)
 ```
 
 ## Quick start
@@ -43,17 +46,28 @@ free).
 git clone https://github.com/itsameeyah/miagpt.git mybot
 cd mybot
 
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env                      # paste your bot token in
-cp persona.example.md persona.md          # then rewrite it (this is the personality)
+cp persona.example.md persona.md          # then rewrite it — this is the personality
 $EDITOR config.toml                       # model endpoint + who's allowed to use it
 
-.venv/bin/python bot.py
+./run.sh                                  # macOS / Linux
+run.bat                                   # Windows (or just double-click it)
 ```
 
-Then type `/ask hello` anywhere in Discord. You want `synced global /ask` and `logged in as ...`
-in the log. Global command sync can take a minute the first time — reload Discord if it's not in
-the list yet.
+The first run creates `.venv` and installs the two dependencies for you. Then type `/ask hello`
+anywhere in Discord. You want `synced global /ask` and `logged in as ...` in the log. Global
+command sync can take a minute the first time — reload Discord if it's not in the list yet.
+
+Not sure something's wrong? `./run.sh --check` (or `run.bat --check`) checks the config, persona,
+token, model endpoint and memory file without connecting to Discord.
+
+Prefer doing it by hand? It's just Python:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip install -r requirements.txt
+.venv/bin/python bot.py                       # Windows: .venv\Scripts\python bot.py
+```
 
 ## 1. Make the Discord app
 
@@ -155,7 +169,12 @@ Two hard filters run before anything reaches the prompt:
 - `[people] blocked` — names that must never surface, e.g. a name someone no longer uses.
 - `[people] self` — names that are you, so the bot doesn't look its own owner up as a stranger.
 
-## 7. Keep it running
+## 7. Keeping it running (optional)
+
+None of this is required. Running `run.sh` / `run.bat` in a terminal is a perfectly good way to
+keep a personal bot up — close the window and it stops.
+
+**Linux** — systemd user service, starts at login and restarts on crash:
 
 ```bash
 ./install.sh              # makes .venv if needed, writes ~/.config/systemd/user/miagpt.service
@@ -164,8 +183,20 @@ journalctl --user -u miagpt -f
 ./install.sh --uninstall  # stop and remove it
 ```
 
-The unit restarts on crash and starts at login. To keep it alive after you log out:
-`loginctl enable-linger $USER`.
+To keep it alive after you log out: `loginctl enable-linger $USER`.
+
+**Windows** — two options, no service needed:
+
+- put a shortcut to `run.bat` in your startup folder (Win+R → `shell:startup`);
+- or Task Scheduler → Create Task → trigger "At log on" → action "Start a program" → your
+  `run.bat`. The Settings tab has "restart if the task fails", which is the closest thing to
+  `Restart=on-failure`.
+
+**macOS** — leave `./run.sh` in a terminal or a `tmux` session. For login start-up, a launchd
+plist in `~/Library/LaunchAgents` with `ProgramArguments` = `.venv/bin/python bot.py` and
+`WorkingDirectory` = the project folder does the same job.
+
+The bot only ever makes outbound connections, so no ports or firewall rules are involved on any OS.
 
 ## 8. Tests
 
@@ -188,6 +219,11 @@ caps and the prompt assembly.
   (opinions, phrases, what they'd refuse to talk about) and measure the typing section.
 - **It answers as the wrong person in DMs.** Add the names it might be called to `[bot] aliases`
   and to `[people] self`.
+- **Windows: `python` is not recognised.** Install Python 3.11+ from python.org and tick "Add
+  python.exe to PATH", or use the `py` launcher: `py -3 -m venv .venv`.
+- **Windows: the window flashes shut.** `run.bat` pauses on errors; if you ran `bot.py` directly,
+  start it from a terminal so you can read what it said. `run.bat --check` also reports the problem
+  without connecting.
 
 ## Notes for whoever inherits this
 
