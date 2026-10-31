@@ -475,6 +475,25 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(sorted(gathered["channels"]), ["general", "second"])
 
 
+class QuoteTests(unittest.TestCase):
+    def test_keeps_real_sentences(self):
+        self.assertTrue(style.looks_like_a_quote("i cant lie, it was kinda eh man"))
+        self.assertTrue(style.looks_like_a_quote("what even"))
+
+    def test_rejects_pastes_links_and_symbol_soup(self):
+        self.assertFalse(style.looks_like_a_quote("https://example.com/thing"))
+        self.assertFalse(style.looks_like_a_quote("x" * 400))
+        self.assertFalse(style.looks_like_a_quote("ok\nsecond line"))
+        self.assertFalse(style.looks_like_a_quote("😭😭💔"))
+        self.assertFalse(style.looks_like_a_quote("yeah"))
+        self.assertFalse(style.looks_like_a_quote("theres this weird tension between me and [redacted] and"))
+        self.assertFalse(style.looks_like_a_quote(":the:the \"do everything\" keybind"))
+
+    def test_quotes_from_bounds_the_list(self):
+        rows = [{"text": f"this is a real message number {i}", "ts": "", "channel": "c"} for i in range(40)]
+        self.assertEqual(len(style.quotes_from(rows, limit=5)), 5)
+
+
 class BatchTests(unittest.TestCase):
     def test_batches_cover_every_sample_and_respect_the_size(self):
         gathered = style.collect(EXPORT, "sam")

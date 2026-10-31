@@ -350,3 +350,32 @@ def batch_samples(gathered: dict, chars_per_batch: int = 28_000) -> list[list[di
     if current:
         batches.append(current)
     return batches
+
+
+QUOTE_MIN, QUOTE_MAX = 8, 180
+
+
+def looks_like_a_quote(text: str) -> bool:
+    """A line worth quoting in a persona: a real sentence, not a paste or a pile of emoji."""
+    t = text.strip()
+    if not (QUOTE_MIN <= len(t) <= QUOTE_MAX):
+        return False
+    if "\n" in t or URL.search(t):
+        return False
+    if len(t.split()) < 2:
+        return False
+    wordish = sum(1 for c in t if c.isalnum() or c in " '’.,!?-…")
+    if wordish / len(t) < 0.85:
+        return False
+    if re.match(r"^:[a-z0-9_+-]+:", t):   # ':emoji:emoji' shortcode soup
+        return False
+    low = t.lower()
+    if "redacted" in low or "deleted-user" in low:
+        return False
+    return True
+
+
+def quotes_from(rows: Sequence[str | dict], limit: int = 12) -> list[str]:
+    """Real example messages for a persona, with the junk filtered out."""
+    good = [_flat(r) for r in rows if looks_like_a_quote(_flat(r))]
+    return samples(good, limit=limit)

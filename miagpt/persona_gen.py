@@ -394,7 +394,7 @@ def interactive(export: Path, who: str | None = None, out: Path | None = None,
                 return 1
 
     batches = style.batch_samples(gathered, chars_per_batch=settings["batch_chars"])
-    quotes = style.samples([row for batch in batches for row in batch], limit=12)
+    quotes = style.quotes_from([row for batch in batches for row in batch], limit=12)
     echo(f"sample: {len(batches)} request(s), {gathered['count']} messages measured")
 
     notes = None if fresh else _load_notes(out, name, str(export), gathered["count"])
